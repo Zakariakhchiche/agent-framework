@@ -4,7 +4,17 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
-from agent_framework import AgentResponse, AgentResponseUpdate, AgentSession, Content, Message, SecretString
+from agent_framework import (
+    AgentResponse,
+    AgentResponseUpdate,
+    AgentSession,
+    Content,
+    ContextProvider,
+    InMemoryHistoryProvider,
+    Message,
+    SecretString,
+    SessionContext,
+)
 from agent_framework.exceptions import AgentException
 from microsoft_agents.copilotstudio.client import ConnectionSettings, CopilotClient
 
@@ -21,6 +31,28 @@ def create_async_generator(items: list[Any]) -> Any:
             yield item
 
     return async_gen()
+
+
+class RecordingContextProvider(ContextProvider):
+    """Context provider that contributes context and records the hooks it receives."""
+
+    def __init__(self) -> None:
+        super().__init__(source_id="recording")
+        self.calls: list[str] = []
+        self.response_text: str | None = None
+
+    async def before_run(
+        self, *, agent: Any, session: AgentSession, context: SessionContext, state: dict[str, Any]
+    ) -> None:
+        self.calls.append("before_run")
+        context.extend_instructions(self.source_id, "Answer in French.")
+        context.extend_messages(self.source_id, [Message(role="user", contents=["The user is in Paris."])])
+
+    async def after_run(
+        self, *, agent: Any, session: AgentSession, context: SessionContext, state: dict[str, Any]
+    ) -> None:
+        self.calls.append("after_run")
+        self.response_text = context.response.text if context.response else None
 
 
 class TestCopilotStudioAgent:
@@ -426,3 +458,89 @@ class TestCopilotStudioAgent:
         with pytest.raises(AgentException, match="Failed to start a new conversation"):
             async for _ in agent.run("test message", stream=True):
                 pass
+
+    async def test_run_invokes_context_providers(
+        self, mock_copilot_client: MagicMock, mock_activity: MagicMock
+    ) -> None:
+        """Test run calls the context providers and sends their context ahead of the question."""
+        provider = RecordingContextProvider()
+        agent = CopilotStudioAgent(client=mock_copilot_client, context_providers=[provider])
+
+        conversation_activity = MagicMock()
+        conversation_activity.conversation.id = "test-conversation-id"
+
+        mock_copilot_client.start_conversation.return_value = create_async_generator([conversation_activity])
+        mock_copilot_client.ask_question.return_value = create_async_generator([mock_activity])
+
+        response = await agent.run("What is the weather?")
+
+        assert response.text == "Test response"
+        assert provider.calls == ["before_run", "after_run"]
+        assert provider.response_text == "Test response"
+        mock_copilot_client.ask_question.assert_called_once_with(
+            "Answer in French.\nThe user is in Paris.\nWhat is the weather?", "test-conversation-id"
+        )
+
+    async def test_run_streaming_invokes_context_providers(self, mock_copilot_client: MagicMock) -> None:
+        """Test streaming run calls after_run once, with the whole response, when the stream ends."""
+        provider = RecordingContextProvider()
+        agent = CopilotStudioAgent(client=mock_copilot_client, context_providers=[provider])
+
+        conversation_activity = MagicMock()
+        conversation_activity.conversation.id = "test-conversation-id"
+
+        typing_activities = []
+        for text in ("Bon", "jour"):
+            typing_activity = MagicMock()
+            typing_activity.text = text
+            typing_activity.type = "typing"
+            typing_activity.id = "test-typing-id"
+            typing_activity.from_property.name = "Test Bot"
+            typing_activities.append(typing_activity)
+
+        mock_copilot_client.start_conversation.return_value = create_async_generator([conversation_activity])
+        mock_copilot_client.ask_question.return_value = create_async_generator(typing_activities)
+
+        updates: list[AgentResponseUpdate] = []
+        async for update in agent.run("What is the weather?", stream=True):
+            assert provider.calls == ["before_run"]
+            updates.append(update)
+
+        assert [update.text for update in updates] == ["Bon", "jour"]
+        assert provider.calls == ["before_run", "after_run"]
+        assert provider.response_text == "Bonjour"
+        mock_copilot_client.ask_question.assert_called_once_with(
+            "Answer in French.\nThe user is in Paris.\nWhat is the weather?", "test-conversation-id"
+        )
+
+    async def test_run_history_provider_stores_messages_without_replaying_them(
+        self, mock_copilot_client: MagicMock
+    ) -> None:
+        """Test a history provider stores each exchange while the question stays the new input only."""
+        history = InMemoryHistoryProvider()
+        agent = CopilotStudioAgent(client=mock_copilot_client, context_providers=[history])
+        session = agent.create_session()
+
+        conversation_activity = MagicMock()
+        conversation_activity.conversation.id = "test-conversation-id"
+        mock_copilot_client.start_conversation.return_value = create_async_generator([conversation_activity])
+
+        for question, answer in (("First question", "First answer"), ("Second question", "Second answer")):
+            activity = MagicMock()
+            activity.text = answer
+            activity.type = "message"
+            activity.id = "test-id"
+            activity.from_property.name = "Test Bot"
+            mock_copilot_client.ask_question.return_value = create_async_generator([activity])
+
+            await agent.run(question, session=session)
+
+            assert mock_copilot_client.ask_question.call_args.args == (question, "test-conversation-id")
+
+        stored = await history.get_messages(session.session_id, state=session.state[history.source_id])
+        assert [(message.role, message.text) for message in stored] == [
+            ("user", "First question"),
+            ("assistant", "First answer"),
+            ("user", "Second question"),
+            ("assistant", "Second answer"),
+        ]
