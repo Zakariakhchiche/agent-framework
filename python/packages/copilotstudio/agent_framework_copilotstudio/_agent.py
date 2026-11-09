@@ -13,9 +13,11 @@ from agent_framework import (
     BaseAgent,
     Content,
     ContextProvider,
+    HistoryProvider,
     Message,
     ResponseStream,
     SecretString,
+    SessionContext,
     normalize_messages,
 )
 from agent_framework._settings import load_settings
@@ -99,7 +101,10 @@ class CopilotStudioAgent(BaseAgent):
             id: id of the CopilotAgent
             name: Name of the CopilotAgent
             description: Description of the CopilotAgent
-            context_providers: Context Providers, to be used by the copilot agent.
+            context_providers: Context Providers, to be used by the copilot agent. Instructions and
+                messages they contribute are sent ahead of the question. Copilot Studio keeps the
+                conversation on the service, so a ``HistoryProvider`` stores each exchange but the
+                history it holds is not replayed.
             middleware: Agent middleware used by the agent, should be a list of AgentMiddlewareTypes.
             environment_id: Environment ID of the Power Platform environment containing
                 the Copilot Studio app. Can also be set via COPILOTSTUDIOAGENT__ENVIRONMENTID
@@ -281,18 +286,20 @@ class CopilotStudioAgent(BaseAgent):
             raise AgentException("CopilotStudioAgent requires service_session_id to be a string")
 
         input_messages = normalize_messages(messages)
-
-        question = "\n".join([message.text for message in input_messages])
+        session_context = await self._run_before_providers(session=session, input_messages=input_messages)
 
         mark_feature_used(FeatureIndex.COPILOTSTUDIO)
-        activities = self.client.ask_question(question, service_session_id)
+        activities = self.client.ask_question(self._build_question(session_context), service_session_id)
         response_messages: list[Message] = []
         response_id: str | None = None
 
         response_messages = [message async for message in self._process_activities(activities, streaming=False)]
         response_id = response_messages[0].message_id if response_messages else None
 
-        return AgentResponse(messages=response_messages, response_id=response_id)
+        response = AgentResponse(messages=response_messages, response_id=response_id)
+        session_context._response = response  # type: ignore[assignment]
+        await self._run_after_providers(session=session, context=session_context)
+        return response
 
     def _run_stream_impl(
         self,
@@ -314,14 +321,14 @@ class CopilotStudioAgent(BaseAgent):
                 raise AgentException("CopilotStudioAgent requires service_session_id to be a string")
 
             input_messages = normalize_messages(messages)
-
-            question = "\n".join([message.text for message in input_messages])
+            session_context = await self._run_before_providers(session=session, input_messages=input_messages)
 
             mark_feature_used(FeatureIndex.COPILOTSTUDIO)
-            activities = self.client.ask_question(question, service_session_id)
+            activities = self.client.ask_question(self._build_question(session_context), service_session_id)
 
+            updates: list[AgentResponseUpdate] = []
             async for message in self._process_activities(activities, streaming=True):
-                yield AgentResponseUpdate(
+                update = AgentResponseUpdate(
                     role=message.role,
                     contents=message.contents,
                     author_name=message.author_name,
@@ -329,11 +336,54 @@ class CopilotStudioAgent(BaseAgent):
                     response_id=message.message_id,
                     message_id=message.message_id,
                 )
+                updates.append(update)
+                yield update
+
+            session_context._response = AgentResponse.from_updates(updates)  # type: ignore[assignment]
+            await self._run_after_providers(session=session, context=session_context)
 
         def _finalize(updates: Sequence[AgentResponseUpdate]) -> AgentResponse[None]:
             return AgentResponse.from_updates(updates)
 
         return ResponseStream(_stream(), finalizer=_finalize)
+
+    async def _run_before_providers(self, *, session: AgentSession, input_messages: list[Message]) -> SessionContext:
+        """Run ``before_run`` on the context providers and return the session context.
+
+        Copilot Studio keeps the conversation on the service, so history providers are not
+        asked to load: replaying their messages would send the agent turns it already has.
+        They still store the exchange in ``after_run``.
+
+        Keyword Args:
+            session: The conversation session.
+            input_messages: The normalized input messages.
+
+        Returns:
+            The session context with the provider contributions populated.
+        """
+        session_context = SessionContext(
+            session_id=session.session_id,
+            service_session_id=session.service_session_id,
+            input_messages=input_messages,
+            options={},
+        )
+        for provider in self.context_providers:
+            if isinstance(provider, HistoryProvider):
+                continue
+            await provider.before_run(
+                agent=self,  # type: ignore[arg-type]
+                session=session,
+                context=session_context,
+                state=session.state.setdefault(provider.source_id, {}),
+            )
+        return session_context
+
+    @staticmethod
+    def _build_question(session_context: SessionContext) -> str:
+        """Build the question from the provider-contributed context and the input messages."""
+        lines = [*session_context.instructions]
+        lines.extend(message.text for message in session_context.get_messages(include_input=True))
+        return "\n".join(lines)
 
     async def _start_new_conversation(self) -> str:
         """Start a new conversation with the Copilot Studio agent.
